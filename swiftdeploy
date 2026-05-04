@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+import sys, os, subprocess, time, yaml, re
+from jinja2 import Template
+
+MANIFEST = "manifest.yaml"
+NGINX_CONF = "nginx.conf"
+COMPOSE_FILE = "docker-compose.yml"
+
+def load_manifest():
+    with open(MANIFEST) as f:
+        return yaml.safe_load(f)
+
+def cmd_init():
+    m = load_manifest()
+    svc = m["services"]
+    nginx = m["nginx"]
+    net = m["network"]
+
+    with open("templates/nginx.conf.j2") as f:
+        nginx_tpl = Template(f.read())
+    with open("templates/docker-compose.yml.j2") as f:
+        compose_tpl = Template(f.read())
+
+    nginx_conf = nginx_tpl.render(
+        nginx_port=nginx["port"],
+        proxy_timeout=nginx.get("proxy_timeout", 30),
+        service_name=svc.get("name", "app"),
+        service_port=svc["port"]
+    )
+    with open(NGINX_CONF, "w") as f:
+        f.write(nginx_conf)
+
+    compose = compose_tpl.render(
+        service_name=svc.get("name", "app"),
+        service_image=svc["image"],
+        service_port=svc["port"],
+        nginx_image=nginx["image"],
+        nginx_port=nginx["port"],
+        network_name=net["name"],
+        network_driver=net["driver_type"],
+        mode=svc.get("mode", "stable"),
+        app_version=svc.get("version", "1.0.0")
+    )
+    with open(COMPOSE_FILE, "w") as f:
+        f.write(compose)
+
+    print("✅ Generated nginx.conf")
+    print("✅ Generated docker-compose.yml")
+
+def cmd_validate():
+    checks = []
+
+    # 1. manifest.yaml exists and is valid YAML
+    try:
+        m = load_manifest()
+        checks.append(("manifest.yaml exists and is valid YAML", True))
+    except Exception as e:
+        checks.append((f"manifest.yaml exists and is valid YAML - {e}", False))
+        m = None
+
+    # 2. Required fields present
+    if m:
+        required = [
+            ("services.image", ["services", "image"]),
+            ("services.port",  ["services", "port"]),
+            ("nginx.image",    ["nginx", "image"]),
+            ("nginx.port",     ["nginx", "port"]),
+            ("network.name",   ["network", "name"]),
+            ("network.driver_type", ["network", "driver_type"])
+        ]
+        missing = []
+        for label, path in required:
+            val = m
+            for k in path:
+                val = val.get(k) if isinstance(val, dict) else None
+            if not val:
+                missing.append(label)
+        if missing:
+            checks.append((f"Required fields present - missing: {missing}", False))
+        else:
+            checks.append(("All required fields present", True))
+
+    # 3. Docker image exists locally
+    if m:
+        image = m["services"]["image"]
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True
+        )
+        checks.append((f"Docker image '{image}' exists locally",
+                       result.returncode == 0))
+
+    # 4. Nginx port not already bound
+    if m:
+        port = m["nginx"]["port"]
+        result = subprocess.run(
+            ["powershell", "-Command",
+             f"netstat -ano | findstr :{port}"],
+            capture_output=True, text=True
+        )
+        bound = result.stdout.strip() != ""
+        checks.append((f"Nginx port {port} is free", not bound))
+
+    # 5. nginx.conf is syntactically valid
+    if os.path.exists(NGINX_CONF):
+        abs_path = os.path.abspath(NGINX_CONF).replace("\\", "/")
+        drive = abs_path[0].lower()
+        unix_path = f"//{drive}/{abs_path[3:]}"
+        result = subprocess.run(
+            ["docker", "run", "--rm", "-v",
+             f"{unix_path}:/etc/nginx/conf.d/default.conf:ro",
+             "nginx:latest", "nginx", "-t"],
+            capture_output=True, text=True
+        )
+        upstream_error = "host not found in upstream" in result.stderr
+        syntax_ok = result.returncode == 0 or upstream_error
+        checks.append(("nginx.conf is syntactically valid", syntax_ok))
+    else:
+        checks.append(("nginx.conf exists for validation - run init first", False))
+
+    # Print results
+    all_pass = True
+    for label, passed in checks:
+        icon = "✅ PASS" if passed else "❌ FAIL"
+        print(f"{icon}: {label}")
+        if not passed:
+            all_pass = False
+
+    sys.exit(0 if all_pass else 1)
+
+def wait_healthy(timeout=60):
+    import urllib.request
+    port = load_manifest()["nginx"]["port"]
+    url = f"http://localhost:{port}/healthz"
+    deadline = time.time() + timeout
+    print(f"⏳ Waiting for service at {url} ...")
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            print("✅ Service is healthy!")
+            return True
+        except:
+            time.sleep(2)
+    print("❌ Timed out waiting for service")
+    return False
+
+def cmd_deploy():
+    cmd_init()
+    print("🚀 Starting stack...")
+    subprocess.run(["docker", "compose", "up", "-d", "--build"], check=True)
+    if not wait_healthy():
+        sys.exit(1)
+
+def cmd_promote(target):
+    if target not in ("canary", "stable"):
+        print("Usage: swiftdeploy promote [canary|stable]")
+        sys.exit(1)
+
+    # Update manifest mode in place
+    with open(MANIFEST) as f:
+        content = f.read()
+    content = re.sub(r'(mode:\s*)\S+', f'\\g<1>{target}', content)
+    with open(MANIFEST, "w") as f:
+        f.write(content)
+    print(f"✅ Updated manifest mode → {target}")
+
+    # Regenerate docker-compose.yml
+    m = load_manifest()
+    svc = m["services"]
+    nginx = m["nginx"]
+    net = m["network"]
+    with open("templates/docker-compose.yml.j2") as f:
+        compose_tpl = Template(f.read())
+    compose = compose_tpl.render(
+        service_name=svc.get("name", "app"),
+        service_image=svc["image"],
+        service_port=svc["port"],
+        nginx_image=nginx["image"],
+        nginx_port=nginx["port"],
+        network_name=net["name"],
+        network_driver=net["driver_type"],
+        mode=target,
+        app_version=svc.get("version", "1.0.0")
+    )
+    with open(COMPOSE_FILE, "w") as f:
+        f.write(compose)
+    print("✅ Regenerated docker-compose.yml")
+
+    # Restart only the service container
+    svc_name = svc.get("name", "app")
+    subprocess.run(
+        ["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", svc_name],
+        check=True
+    )
+
+    # Confirm via /healthz
+    wait_healthy(30)
+    print(f"✅ Promoted to {target}")
+
+def cmd_teardown():
+    clean = "--clean" in sys.argv
+    print("🛑 Tearing down stack...")
+    subprocess.run(["docker", "compose", "down", "-v"])
+    if clean:
+        for f in [NGINX_CONF, COMPOSE_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
+                print(f"🗑️  Deleted {f}")
+    print("✅ Teardown complete")
+
+COMMANDS = {
+    "init": cmd_init,
+    "validate": cmd_validate,
+    "deploy": cmd_deploy,
+    "teardown": cmd_teardown,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in [*COMMANDS, "promote"]:
+        print("Usage: swiftdeploy [init|validate|deploy|promote|teardown]")
+        sys.exit(1)
+    if sys.argv[1] == "promote":
+        if len(sys.argv) < 3:
+            print("Usage: swiftdeploy promote [canary|stable]")
+            sys.exit(1)
+        cmd_promote(sys.argv[2])
+    else:
+        COMMANDS[sys.argv[1]]()

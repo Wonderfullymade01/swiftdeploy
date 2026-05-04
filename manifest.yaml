@@ -1,0 +1,15 @@
+services:
+  name: app
+  image: wonderfullymade-api:latest
+  port: 3000
+  version: "1.0.0"
+  mode: canary
+
+nginx:
+  image: nginx:latest
+  port: 8080
+  proxy_timeout: 30
+
+network:
+  name: swiftdeploy-net
+  driver_type: bridge
