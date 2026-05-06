@@ -3,6 +3,8 @@ version: "3.9"
 networks:
   swiftdeploy-net:
     driver: bridge
+  opa-internal:
+    driver: bridge
 
 volumes:
   app_logs:
@@ -41,4 +43,20 @@ services:
       - swiftdeploy-net
     depends_on:
       - app
+    restart: unless-stopped
+
+  opa:
+    image: openpolicyagent/opa:latest
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--log-level=error"
+      - "/policies"
+    volumes:
+      - ./policies:/policies:ro
+    networks:
+      - opa-internal
+    ports:
+      - "8181:8181"
     restart: unless-stopped

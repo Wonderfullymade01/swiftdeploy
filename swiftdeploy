@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-import sys, os, subprocess, time, yaml, re
+import sys, os, subprocess, time, yaml, re, json, shutil
+import urllib.request, urllib.error
 from jinja2 import Template
+from datetime import datetime, timezone
 
 MANIFEST = "manifest.yaml"
 NGINX_CONF = "nginx.conf"
 COMPOSE_FILE = "docker-compose.yml"
+HISTORY_FILE = "history.jsonl"
+OPA_URL = "http://localhost:8181"
 
 def load_manifest():
     with open(MANIFEST) as f:
@@ -50,7 +54,6 @@ def cmd_init():
 def cmd_validate():
     checks = []
 
-    # 1. manifest.yaml exists and is valid YAML
     try:
         m = load_manifest()
         checks.append(("manifest.yaml exists and is valid YAML", True))
@@ -58,7 +61,6 @@ def cmd_validate():
         checks.append((f"manifest.yaml exists and is valid YAML - {e}", False))
         m = None
 
-    # 2. Required fields present
     if m:
         required = [
             ("services.image", ["services", "image"]),
@@ -80,7 +82,6 @@ def cmd_validate():
         else:
             checks.append(("All required fields present", True))
 
-    # 3. Docker image exists locally
     if m:
         image = m["services"]["image"]
         result = subprocess.run(
@@ -90,7 +91,6 @@ def cmd_validate():
         checks.append((f"Docker image '{image}' exists locally",
                        result.returncode == 0))
 
-    # 4. Nginx port not already bound
     if m:
         port = m["nginx"]["port"]
         result = subprocess.run(
@@ -101,7 +101,6 @@ def cmd_validate():
         bound = result.stdout.strip() != ""
         checks.append((f"Nginx port {port} is free", not bound))
 
-    # 5. nginx.conf is syntactically valid
     if os.path.exists(NGINX_CONF):
         abs_path = os.path.abspath(NGINX_CONF).replace("\\", "/")
         drive = abs_path[0].lower()
@@ -118,7 +117,6 @@ def cmd_validate():
     else:
         checks.append(("nginx.conf exists for validation - run init first", False))
 
-    # Print results
     all_pass = True
     for label, passed in checks:
         icon = "✅ PASS" if passed else "❌ FAIL"
@@ -128,9 +126,161 @@ def cmd_validate():
 
     sys.exit(0 if all_pass else 1)
 
+def get_host_stats():
+    import shutil as sh
+    disk = sh.disk_usage(".")
+    disk_free_gb = disk.free / (1024 ** 3)
+    try:
+        import psutil
+        cpu_load = psutil.cpu_percent(interval=1) / 100.0
+        mem = psutil.virtual_memory()
+        mem_free_gb = mem.available / (1024 ** 3)
+    except Exception:
+        cpu_load = 0.0
+        mem_free_gb = 8.0
+    return {
+        "disk_free_gb": round(disk_free_gb, 2),
+        "cpu_load": round(cpu_load, 2),
+        "mem_free_gb": round(mem_free_gb, 2)
+    }
+
+def query_opa(package, input_data):
+    url = f"{OPA_URL}/v1/data/{package}/decision"
+    payload = json.dumps({"input": input_data}).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read())
+            return result.get("result", {})
+    except urllib.error.URLError as e:
+        return {"error": f"OPA unreachable: {e.reason}"}
+    except Exception as e:
+        return {"error": f"OPA query failed: {str(e)}"}
+
+def check_opa_deploy():
+    print("🔍 Running pre-deploy policy checks...")
+    stats = get_host_stats()
+    print(f"   Disk free: {stats['disk_free_gb']}GB | CPU load: {stats['cpu_load']} | Mem free: {stats['mem_free_gb']}GB")
+    result = query_opa("infrastructure", stats)
+    if "error" in result:
+        print(f"⚠️  OPA unavailable: {result['error']}")
+        print("⚠️  Proceeding without policy check")
+        return True
+    allowed = result.get("allow", False)
+    reasons = result.get("reasons", [])
+    if allowed:
+        print("✅ Infrastructure policy: PASSED")
+        return True
+    else:
+        print("❌ Infrastructure policy: FAILED")
+        for r in reasons:
+            print(f"   → {r}")
+        return False
+
+def scrape_metrics():
+    m = load_manifest()
+    port = m["nginx"]["port"]
+    url = f"http://localhost:{port}/metrics"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return resp.read().decode()
+    except Exception:
+        return None
+
+def parse_metrics(raw):
+    metrics = {}
+    if not raw:
+        return metrics
+    for line in raw.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split(" ")
+        if len(parts) >= 2:
+            metrics[parts[0]] = float(parts[1])
+    return metrics
+
+def calculate_error_rate(raw):
+    if not raw:
+        return 0.0
+    total = 0.0
+    errors = 0.0
+    for line in raw.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        if 'http_requests_total' in line and '{' in line:
+            parts = line.split(" ")
+            if len(parts) >= 2:
+                val = float(parts[1])
+                total += val
+                if 'status_code="5' in line:
+                    errors += val
+    if total == 0:
+        return 0.0
+    return errors / total
+
+def calculate_p99(raw):
+    if not raw:
+        return 0.0
+    buckets = []
+    total_count = 0.0
+    for line in raw.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        if 'http_request_duration_seconds_bucket' in line:
+            parts = line.split(" ")
+            if len(parts) >= 2:
+                le_match = re.search(r'le="([^"]+)"', line)
+                if le_match:
+                    le = le_match.group(1)
+                    val = float(parts[1])
+                    if le != "+Inf":
+                        buckets.append((float(le), val))
+                    else:
+                        total_count = val
+    if not buckets or total_count == 0:
+        return 0.0
+    p99_threshold = total_count * 0.99
+    for le, count in sorted(buckets):
+        if count >= p99_threshold:
+            return le * 1000
+    return buckets[-1][0] * 1000
+
+def check_opa_promote():
+    print("🔍 Running pre-promote policy checks...")
+    raw = scrape_metrics()
+    if not raw:
+        print("⚠️  Could not scrape /metrics - is the service running?")
+        return False
+    error_rate = calculate_error_rate(raw)
+    p99_ms = calculate_p99(raw)
+    print(f"   Error rate: {error_rate*100:.2f}% | P99 latency: {p99_ms:.0f}ms")
+    result = query_opa("canary", {
+        "error_rate": error_rate,
+        "p99_latency_ms": p99_ms
+    })
+    if "error" in result:
+        print(f"⚠️  OPA unavailable: {result['error']}")
+        print("⚠️  Proceeding without policy check")
+        return True
+    allowed = result.get("allow", False)
+    reasons = result.get("reasons", [])
+    if allowed:
+        print("✅ Canary safety policy: PASSED")
+        return True
+    else:
+        print("❌ Canary safety policy: FAILED")
+        for r in reasons:
+            print(f"   → {r}")
+        return False
+
 def wait_healthy(timeout=60):
-    import urllib.request
-    port = load_manifest()["nginx"]["port"]
+    m = load_manifest()
+    port = m["nginx"]["port"]
     url = f"http://localhost:{port}/healthz"
     deadline = time.time() + timeout
     print(f"⏳ Waiting for service at {url} ...")
@@ -144,27 +294,55 @@ def wait_healthy(timeout=60):
     print("❌ Timed out waiting for service")
     return False
 
+def wait_opa(timeout=30):
+    url = f"{OPA_URL}/health"
+    deadline = time.time() + timeout
+    print("⏳ Waiting for OPA...")
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            print("✅ OPA is ready!")
+            return True
+        except:
+            time.sleep(2)
+    print("⚠️  OPA did not become ready in time")
+    return False
+
+def log_history(event, data):
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **data
+    }
+    with open(HISTORY_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
 def cmd_deploy():
+    if not check_opa_deploy():
+        print("🚫 Deployment blocked by policy")
+        sys.exit(1)
     cmd_init()
     print("🚀 Starting stack...")
     subprocess.run(["docker", "compose", "up", "-d", "--build"], check=True)
+    wait_opa()
     if not wait_healthy():
         sys.exit(1)
+    log_history("deploy", {"mode": load_manifest()["services"].get("mode", "stable")})
 
 def cmd_promote(target):
     if target not in ("canary", "stable"):
         print("Usage: swiftdeploy promote [canary|stable]")
         sys.exit(1)
-
-    # Update manifest mode in place
+    if target == "stable":
+        if not check_opa_promote():
+            print("🚫 Promotion blocked by canary safety policy")
+            sys.exit(1)
     with open(MANIFEST) as f:
         content = f.read()
     content = re.sub(r'(mode:\s*)\S+', f'\\g<1>{target}', content)
     with open(MANIFEST, "w") as f:
         f.write(content)
     print(f"✅ Updated manifest mode → {target}")
-
-    # Regenerate docker-compose.yml
     m = load_manifest()
     svc = m["services"]
     nginx = m["nginx"]
@@ -185,17 +363,117 @@ def cmd_promote(target):
     with open(COMPOSE_FILE, "w") as f:
         f.write(compose)
     print("✅ Regenerated docker-compose.yml")
-
-    # Restart only the service container
     svc_name = svc.get("name", "app")
     subprocess.run(
         ["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", svc_name],
         check=True
     )
-
-    # Confirm via /healthz
     wait_healthy(30)
+    log_history("promote", {"mode": target})
     print(f"✅ Promoted to {target}")
+
+def cmd_status():
+    print("📊 SwiftDeploy Status Dashboard")
+    print("=" * 50)
+    raw = scrape_metrics()
+    if not raw:
+        print("❌ Could not reach /metrics - is the stack running?")
+        sys.exit(1)
+    error_rate = calculate_error_rate(raw)
+    p99_ms = calculate_p99(raw)
+    metrics = parse_metrics(raw)
+    uptime = metrics.get("app_uptime_seconds", 0)
+    mode = "canary" if metrics.get("app_mode", 0) == 1 else "stable"
+    chaos = int(metrics.get("chaos_active", 0))
+    chaos_label = {0: "none", 1: "slow", 2: "error"}.get(chaos, "unknown")
+    print(f"  Mode:         {mode}")
+    print(f"  Uptime:       {uptime:.0f}s")
+    print(f"  Chaos:        {chaos_label}")
+    print(f"  Error rate:   {error_rate*100:.2f}%")
+    print(f"  P99 latency:  {p99_ms:.0f}ms")
+    print()
+    print("📋 Policy Compliance:")
+    stats = get_host_stats()
+    infra = query_opa("infrastructure", stats)
+    canary = query_opa("canary", {
+        "error_rate": error_rate,
+        "p99_latency_ms": p99_ms
+    })
+    if "error" in infra:
+        print(f"  ⚠️  Infrastructure policy: OPA unavailable")
+    elif infra.get("allow"):
+        print(f"  ✅ Infrastructure policy: PASSING")
+    else:
+        print(f"  ❌ Infrastructure policy: FAILING")
+        for r in infra.get("reasons", []):
+            print(f"     → {r}")
+    if "error" in canary:
+        print(f"  ⚠️  Canary safety policy: OPA unavailable")
+    elif canary.get("allow"):
+        print(f"  ✅ Canary safety policy: PASSING")
+    else:
+        print(f"  ❌ Canary safety policy: FAILING")
+        for r in canary.get("reasons", []):
+            print(f"     → {r}")
+    log_history("status_scrape", {
+        "error_rate": error_rate,
+        "p99_latency_ms": p99_ms,
+        "mode": mode,
+        "chaos": chaos_label,
+        "infra_pass": infra.get("allow", False),
+        "canary_pass": canary.get("allow", False)
+    })
+    print()
+    print(f"📝 Logged to {HISTORY_FILE}")
+
+def cmd_audit():
+    if not os.path.exists(HISTORY_FILE):
+        print("❌ No history.jsonl found - run some commands first")
+        sys.exit(1)
+    events = []
+    with open(HISTORY_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+    report = ["# SwiftDeploy Audit Report", ""]
+    report.append(f"Generated: {datetime.now(timezone.utc).isoformat()}")
+    report.append("")
+    report.append("## Timeline")
+    report.append("")
+    report.append("| Timestamp | Event | Details |")
+    report.append("|-----------|-------|---------|")
+    for e in events:
+        ts = e.get("timestamp", "")
+        event = e.get("event", "")
+        details = ""
+        if event == "deploy":
+            details = f"Deployed in {e.get('mode','?')} mode"
+        elif event == "promote":
+            details = f"Promoted to {e.get('mode','?')}"
+        elif event == "status_scrape":
+            details = f"mode={e.get('mode','?')} error_rate={e.get('error_rate',0)*100:.2f}% p99={e.get('p99_latency_ms',0):.0f}ms chaos={e.get('chaos','none')}"
+        report.append(f"| {ts} | {event} | {details} |")
+    report.append("")
+    report.append("## Policy Violations")
+    report.append("")
+    violations = [e for e in events if e.get("event") == "status_scrape" and
+                  (not e.get("infra_pass", True) or not e.get("canary_pass", True))]
+    if violations:
+        report.append("| Timestamp | Policy | Details |")
+        report.append("|-----------|--------|---------|")
+        for v in violations:
+            ts = v.get("timestamp", "")
+            if not v.get("infra_pass", True):
+                report.append(f"| {ts} | Infrastructure | Policy check failed |")
+            if not v.get("canary_pass", True):
+                report.append(f"| {ts} | Canary Safety | error_rate={v.get('error_rate',0)*100:.2f}% p99={v.get('p99_latency_ms',0):.0f}ms |")
+    else:
+        report.append("No policy violations recorded.")
+    report.append("")
+    with open("audit_report.md", "w") as f:
+        f.write("\n".join(report))
+    print("✅ Generated audit_report.md")
 
 def cmd_teardown():
     clean = "--clean" in sys.argv
@@ -213,11 +491,13 @@ COMMANDS = {
     "validate": cmd_validate,
     "deploy": cmd_deploy,
     "teardown": cmd_teardown,
+    "status": cmd_status,
+    "audit": cmd_audit,
 }
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in [*COMMANDS, "promote"]:
-        print("Usage: swiftdeploy [init|validate|deploy|promote|teardown]")
+        print("Usage: swiftdeploy [init|validate|deploy|promote|teardown|status|audit]")
         sys.exit(1)
     if sys.argv[1] == "promote":
         if len(sys.argv) < 3:
