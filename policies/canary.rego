@@ -7,9 +7,9 @@ deny_reasons := reasons if {
     reasons := [msg |
         checks := [
             [input.error_rate > data.thresholds.max_error_rate,
-             sprintf("Error rate (%.2f%%) exceeds maximum (1.00%%)", [input.error_rate * 100])],
+             sprintf("Error rate exceeds maximum of 1.00%% (current: %.2f%%)", [input.error_rate * 100])],
             [input.p99_latency_ms > data.thresholds.max_p99_latency_ms,
-             sprintf("P99 latency (%.0fms) exceeds maximum (500ms)", [input.p99_latency_ms])]
+             sprintf("P99 latency exceeds maximum of 500ms (current: %.0fms)", [input.p99_latency_ms])]
         ]
         check := checks[_]
         check[0] == true

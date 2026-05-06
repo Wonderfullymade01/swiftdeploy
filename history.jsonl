@@ -7,3 +7,6 @@
 {"timestamp": "2026-05-05T22:26:15.110824+00:00", "event": "status_scrape", "error_rate": 0.0, "p99_latency_ms": 5.0, "mode": "canary", "chaos": "error", "infra_pass": true, "canary_pass": true}
 {"timestamp": "2026-05-05T22:30:50.818604+00:00", "event": "status_scrape", "error_rate": 0.5333333333333333, "p99_latency_ms": 5.0, "mode": "canary", "chaos": "error", "infra_pass": true, "canary_pass": false}
 {"timestamp": "2026-05-06T00:47:10.496016+00:00", "event": "status_scrape", "error_rate": 0.5, "p99_latency_ms": 5.0, "mode": "canary", "chaos": "error", "infra_pass": true, "canary_pass": false}
+{"timestamp": "2026-05-06T10:11:01.427566+00:00", "event": "status_scrape", "error_rate": 0.0, "p99_latency_ms": 0.0, "mode": "canary", "chaos": "none", "infra_pass": true, "canary_pass": true}
+{"timestamp": "2026-05-06T10:32:15.337270+00:00", "event": "status_scrape", "error_rate": 0.6666666666666666, "p99_latency_ms": 5.0, "mode": "canary", "chaos": "error", "infra_pass": true, "canary_pass": false}
+{"timestamp": "2026-05-06T10:50:28.504294+00:00", "event": "promote", "mode": "stable"}

@@ -13,7 +13,7 @@ services:
   app:
     image: wonderfullymade-api:latest
     environment:
-      - MODE=canary
+      - MODE=stable
       - APP_VERSION=1.0.0
       - APP_PORT=3000
     networks:
