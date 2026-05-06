@@ -113,3 +113,8 @@ curl -X POST http://localhost:8080/chaos \
 
 All required screenshots (validate, deploy, promote, generated configs, nginx logs) are available here:
 [Google Drive Screenshots](https://drive.google.com/drive/folders/14XGwV2dSIvRr3fh93Z0U6mDU9djSGsEA?usp=sharing) 
+
+## Blog Post
+
+Full technical deep dive:
+[SwiftDeploy: How I Built a Tool That Writes Its Own Infrastructure Files](https://dev.to/wonderfullymade01/swiftdeploy-how-i-built-a-tool-that-writes-its-own-infrastructure-files-4cmp)
